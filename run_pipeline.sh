@@ -76,6 +76,9 @@ opt "[2] Adversarial Validation" python3 adversarial_validation.py
 # ----- 3. Null Importance 特徴量選択（レポートのみ。反映は HC_APPLY_FS=1） -----
 opt "[3] 特徴量選択 (null importance)" python3 feature_selection.py
 
+# ----- 3b. 特徴量重要度の分析（ドメイン特徴の効き目をカテゴリ別に確認） -----
+opt "[3b] 特徴量重要度の分析 (gain/グループ別ロールアップ)" python3 feature_importance.py
+
 # ----- 4. DAE 学習 & 埋め込み抽出 -----
 if skip_if "$PROC_DIR/dae_train_embeddings.parquet"; then
     echo ">>> [4] DAE: キャッシュ済みスキップ"

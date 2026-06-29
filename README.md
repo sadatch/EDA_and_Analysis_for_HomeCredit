@@ -11,6 +11,7 @@
 | 特徴量 | 期間別時系列集約（全期間/直近6M/1Y/3M）、bureau_balance DPDトレンド、credit_cardフル集約 | 既存notebook + HC 1位 |
 | 特徴量 | **neighbors_target_mean**（EXT_SOURCE×CREDIT_ANNUITY_RATIO空間のK近傍TARGET平均, OOFリーク制御） | HC **1位**の目玉特徴 |
 | 特徴量 | 算術交互作用（EXT×金額/日数の乗除）、CV安全な**OOF target encoding** | HC 1位 / 定石 |
+| 特徴量 | **金融ドメイン指標**（全債務横断DTI/延滞トレンド/申込ベロシティ/利用率, DOM_*）＋重要度分析ツール | クレジットリスク実務 |
 | 表現学習 | **Swap Noise DAE**（教師なし, Encoder各層concat埋め込み） | HC **2位** ikiri_DS |
 | モデル | **LightGBM / XGBoost / CatBoost** 3本柱 + DAE特徴MLP | 定石（3 GBDT + NN） |
 | 学習 | **GPU実行**（XGB=cuda, CatBoost=GPU, LightGBMはGPUビルドがあればGPU/無ければ自動CPU） | Playbook #fast-exp |
@@ -29,6 +30,8 @@ make_synthetic_data.py   スモークテスト用の合成データ生成（本�
 
 feature_engineering.py   テーブル集約＋ドメイン特徴＋EXT_SOURCE補完
 oof_features.py          1位の近傍TARGET平均 / OOF target encoding / 算術交互作用
+domain_features.py       金融ドメイン特徴(DTI/延滞トレンド/申込ベロシティ/利用率 等, DOM_*)
+feature_importance.py    LightGBM重要度をカテゴリ別に集計（ドメイン特徴の効き目検証）
 dae_model.py             Swap Noise DAE本体（PyTorch）
 dae_features.py          DAE学習 & 埋め込み抽出
 
@@ -121,6 +124,35 @@ HC_OPTUNA_TRIALS=120 HC_N_SEEDS=10 HC_DAE_HIDDEN=2048 ./run_pipeline.sh full
 # VRAMが厳しい時はDAEを下げる
 HC_DAE_HIDDEN=512 HC_DAE_BATCH=512 ./run_pipeline.sh full
 ```
+
+### 金融ドメイン特徴（DOM_*）の検証ワークフロー
+
+`domain_features.py` がクレジットリスク実務の指標を7カテゴリで付与する（列名プレフィックスで識別）:
+
+| プレフィックス | 内容 | 主な指標例 |
+|---|---|---|
+| `DOM_CAP_` | 返済能力 / DTI（全債務横断） | 他社残債/収入、総エクスポージャ/収入、可処分残/人 |
+| `DOM_LEV_` | レバレッジ / 与信妥当性 | 延滞債務比率、頭金率、申請/承認ギャップ |
+| `DOM_DLQ_` | 延滞の深刻度・直近トレンド | 最大DPD、直近1年の延滞/過小払いトレンド |
+| `DOM_VEL_` | 申込ベロシティ | 信用照会の直近集中度、アクティブ口座比率 |
+| `DOM_UTL_` | カード利用・キャッシング苦境 | 利用率、ATM現金引出依存、最低返済不足 |
+| `DOM_PAY_` | 返済行動（installments） | 生涯支払充足率、最大遅延、延滞率 |
+| `DOM_STB_` | 安定性・外部スコア交互作用 | EXT×地域、社会的圏のデフォルト率、電話番号変更/年齢 |
+
+各特徴は「元の列が存在するときだけ」作るので、合成データでも実データでも落ちない（実データの方が
+照会・社会的圏・キャッシング系の列がある分、生成数は増える）。
+
+**「この指標は要るか？」をLightGBM視点で確認**するのが `feature_importance.py`:
+
+```bash
+python3 feature_importance.py            # カテゴリ別gainシェア + DOM_*のランキングを表示
+python3 feature_importance.py --no-dae   # DAEを除いて手作り特徴に集中して見る
+```
+
+出力 `artifacts/feature_importance.csv`（特徴別 gain/split/順位）と
+`artifacts/feature_importance_groups.csv`（カテゴリ別シェア）を見て、
+gainが極端に低いDOM_列は外す、効くカテゴリは派生を増やす、という形で**一個ずつ検証**できる。
+カテゴリ単位でON/OFFしてA/Bしたいときは `HC_FE_DOMAIN=0`（ドメイン特徴を丸ごと無効化）も使える。
 
 ### 特徴量選択を実際に反映する
 `feature_selection.py` はデフォルトでは**レポートのみ**（まず中身を確認できるように安全側）。

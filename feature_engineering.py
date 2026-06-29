@@ -25,6 +25,7 @@ import lightgbm as lgb
 import config
 from utils import timer, reduce_mem_usage, build_agg_rules, flatten_agg_columns, safe_merge
 import oof_features
+import domain_features
 
 
 # =====================================================================
@@ -316,6 +317,10 @@ def main():
         app_test = full_df[full_df["TARGET"].isnull()].drop(columns=["TARGET"]).copy()
         del full_df, known, unknown
         gc.collect()
+
+    if config.FE_USE_DOMAIN:
+        with timer("金融ドメイン特徴 (DTI/延滞/ベロシティ/利用率 等)"):
+            app_train, app_test = domain_features.add_domain_features(app_train, app_test)
 
     if config.FE_USE_NEIGHBORS:
         with timer("近傍TARGET平均 (1位の目玉特徴, OOFリーク制御)"):

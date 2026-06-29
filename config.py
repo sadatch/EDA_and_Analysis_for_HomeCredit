@@ -110,6 +110,7 @@ CAT_TASK_TYPE = os.environ.get("HC_CAT_TASK", "GPU" if USE_GPU_GBDT else "CPU") 
 # ===== 特徴量エンジニアリングのトグル =====
 FE_USE_NEIGHBORS = _env_flag("HC_FE_NEIGHBORS", True)   # 1位の目玉: neighbors_target_mean
 FE_USE_TARGET_ENC = _env_flag("HC_FE_TARGET_ENC", True)  # CV安全なOOF target encoding
+FE_USE_DOMAIN = _env_flag("HC_FE_DOMAIN", True)          # 金融ドメイン特徴(DOM_*)
 FE_SELECTION_APPLY = _env_flag("HC_APPLY_FS", False)     # feature_selection.jsonのdropを学習に反映するか
 NEIGHBORS_K = _env_int("HC_NEIGHBORS_K", 100 if SMOKE else 500)
 # target encodingをかけるカテゴリ列（存在する列のみ使用）
