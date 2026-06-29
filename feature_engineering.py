@@ -24,6 +24,7 @@ import lightgbm as lgb
 
 import config
 from utils import timer, reduce_mem_usage, build_agg_rules, flatten_agg_columns, safe_merge
+import oof_features
 
 
 # =====================================================================
@@ -262,6 +263,7 @@ def main():
         df["CREDIT_INCOME_RATIO"] = df["AMT_CREDIT"] / df["AMT_INCOME_TOTAL"]
         df["ANNUITY_INCOME_RATIO"] = df["AMT_ANNUITY"] / df["AMT_INCOME_TOTAL"]
         df["CREDIT_TERM"] = df["AMT_ANNUITY"] / df["AMT_CREDIT"]
+        df["CREDIT_ANNUITY_RATIO"] = df["AMT_CREDIT"] / (df["AMT_ANNUITY"] + 1e-5)  # 1位の近傍特徴で使用
         df["DAYS_EMPLOYED_PERCENT"] = df["DAYS_EMPLOYED"] / df["DAYS_BIRTH"]
         df["INCOME_PER_PERSON"] = df["AMT_INCOME_TOTAL"] / df["CNT_FAM_MEMBERS"]
         df["EXT_SOURCE_MEAN"] = df[["EXT_SOURCE_1", "EXT_SOURCE_2", "EXT_SOURCE_3"]].mean(axis=1)
@@ -269,6 +271,9 @@ def main():
         df["EXT_SOURCE_MIN"] = df[["EXT_SOURCE_1", "EXT_SOURCE_2", "EXT_SOURCE_3"]].min(axis=1)
         df["EXT_SOURCE_PROD"] = df["EXT_SOURCE_1"] * df["EXT_SOURCE_2"] * df["EXT_SOURCE_3"]
         df["EXT_SOURCE_STD"] = df[["EXT_SOURCE_1", "EXT_SOURCE_2", "EXT_SOURCE_3"]].std(axis=1)
+
+    print("算術交互作用特徴を追加 (1位チーム手法)...")
+    app_train, app_test = oof_features.add_arithmetic_interactions(app_train, app_test)
 
     table_builders = [
         ("bureau", get_aggregated_bureau),
@@ -311,6 +316,14 @@ def main():
         app_test = full_df[full_df["TARGET"].isnull()].drop(columns=["TARGET"]).copy()
         del full_df, known, unknown
         gc.collect()
+
+    if config.FE_USE_NEIGHBORS:
+        with timer("近傍TARGET平均 (1位の目玉特徴, OOFリーク制御)"):
+            app_train, app_test = oof_features.add_neighbor_target_features(app_train, app_test)
+
+    if config.FE_USE_TARGET_ENC:
+        with timer("OOF target encoding"):
+            app_train, app_test = oof_features.add_target_encoding(app_train, app_test)
 
     with timer("メモリ最適化 & 保存"):
         app_train = reduce_mem_usage(app_train)
