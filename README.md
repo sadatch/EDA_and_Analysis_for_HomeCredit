@@ -4,6 +4,12 @@
 ベースに、**Home Credit 1位/2位解法**と**最近のテーブルコンペ上位の定石**（NVIDIA Kaggle Grandmasters Playbook）を
 全部入りにして、`Ryzen 7 3800XT (16T) / RTX 3070Ti 8GB / 48GB RAM` で一晩〜半日回す前提のバッチに仕立てたもの。
 
+途中から、独立に構築した**セカンドパイプライン（`hc_ensemble_optuna`系 / `hc_campaign.py`）**を
+別トラックとして走らせ、両パイプラインのOOF予測をアンサンブル統合するに至った（詳細は
+[セカンドパイプラインの章](#セカンドパイプライン-hc_campaign--独立特徴量セットとのアンサンブル統合)参照）。
+実際の取り組みの流れ・全特徴量・遭遇したバグを含む完全な記録は
+[`Home_Credit_取り組みまとめ.md`](./Home_Credit_取り組みまとめ.md) にまとめてある。
+
 ## このパイプラインで入っているもの（取り込んだトレンド）
 
 | 区分 | 手法 | 出典 |
@@ -70,6 +76,17 @@ feature_selection.py       Null Importanceで効かない特徴を抽出（レ�
 ensemble.py                hill climbing / stacking / weighted を比較し最終submission作成
 
 run_pipeline.sh          全部を順に回す寝バッチ（再開可能・ログ付き）
+
+# --- セカンドパイプライン（独立に構築、詳細は下の専用章を参照） ---
+hc_ensemble_optuna.py    セカンドパイプライン本体（前処理・GBDT共通学習フレーム・Optuna）
+hc_ensemble_optuna_v2.py 時間窓/last-k集約・トレンド・グループ統計・Null Importance選択
+hc_ensemble_optuna_v3.py KNNターゲット特徴・行レベル補助モデル(prev/installments)・EMA/lag特徴
+hc_ensemble_optuna_v4.py 行レベル補助モデル(bureau_balance)・モデル動物園・pseudo label・2層stack
+hc_campaign.py           段階実行ランナー（features/tune/train/register/ensemble/status）
+hc_v5_final_push.py      最終施策: 現申込金利推定特徴 + restackアンサンブル
+hc_v6_lastday.py         最終施策: POS行レベル特徴・KNNバリエーション・CatBoostネイティブカテゴリ・10-fold低lr LGBM
+export_old_oof_for_registration.py  メインパイプラインのOOF/predをセカンド側に登録するための変換
+blend_final.py / blend_d4d6.py      提出ファイル同士のrank平均ブレンド（最後の保険）
 ```
 
 ## 使い方
@@ -141,7 +158,7 @@ python3 train_gru_seq.py   # GRU月次系列（M3, torch必須）
 | `HC_N_SEEDS` | シード平均の本数 | 5 | 3 |
 | `HC_OPTUNA_TRIALS` | Optuna試行数（lgb/xgb/cat各） | 60 | 25 |
 | `HC_DO_TUNE` | Optunaを回すか | 1 | 0（固定パラメータで高速化） |
-| `HC_DAE_HIDDEN` | DAE隠れ層（VRAM 8GBなら1024〜2048） | 1024 | 1024 |
+| `HC_DAE_HIDDEN` | DAE隠れ層 | **256**（※下記の注記参照） | 256 |
 | `HC_GPU` | GBDTでGPUを使うか | 1 | 1 |
 | `HC_FULL_REFIT` | 全データ100%再学習ブレンド | 1 | 0 |
 | `HC_PSEUDO` | 擬似ラベルを回すか | 1 | 0 |
@@ -161,11 +178,17 @@ hc_campaign 系（hc_ensemble_optuna v1〜v4）専用の環境変数:
 ```bash
 # 一晩で終わらせたい
 HC_OPTUNA_TRIALS=25 HC_N_SEEDS=3 ./run_pipeline.sh full
-# 数日かけて最大火力
-HC_OPTUNA_TRIALS=120 HC_N_SEEDS=10 HC_DAE_HIDDEN=2048 ./run_pipeline.sh full
-# VRAMが厳しい時はDAEを下げる
-HC_DAE_HIDDEN=512 HC_DAE_BATCH=512 ./run_pipeline.sh full
+# 数日かけて最大火力（ただしDAE_HIDDENは下記の注記を読んでから上げること）
+HC_OPTUNA_TRIALS=120 HC_N_SEEDS=10 ./run_pipeline.sh full
 ```
+
+> **⚠ DAE_HIDDENを上げる際の注意（実際に発生したVRAM事故）**
+> 特徴量数を増やした状態で`HC_DAE_HIDDEN=1024`（3層concatで埋め込み3072次元、
+> 総特徴量4788本）にしたところ、RTX 3070 Ti (8GB VRAM) 上でXGBoost GPUの
+> `QuantileDMatrix`構築がVRAM容量を超えて17時間以上ハングした（nvidia-smi上は
+> 動いているように見えるが進捗ゼロ）。デフォルトを`256`（768次元embedding）に
+> 戻すことで解消済み。特徴量数を大きく増やす変更をした後にDAE_HIDDENを上げる場合は、
+> 必ずnvidia-smiで最初の数分だけ監視し、進捗が止まっていたら即座にCPUへ切り替えること。
 
 ### 金融ドメイン特徴（DOM_*）の検証ワークフロー
 
@@ -321,12 +344,95 @@ artifacts/optuna.db               Optuna探索履歴（resume用）
   CatBoost/XGBもGPU失敗時はCPUへフォールバック。どの環境でも止まらない。
 - **欠損ライブラリ耐性**: catboost/xgboost/torch/optunaが未インストールでも、
   該当ステップだけスキップしてアンサンブルまで到達する（`run_pipeline.sh` のopt/must制御）。
-- **検証状況**: 本コードは合成データでパイプライン全体（特徴量→各モデル→擬似ラベル→
-  hill climbing/stacking→submission）の動作を確認済み。**本番のKaggle実データでの数値検証は未実施**なので、
-  実行後に `cv_scores.json` / `ensemble_report.json` のOOF AUCが
-  既存notebook単体（LGBM+XGB）を下回っていないか必ず確認すること。
+- **検証状況**: 合成データでの動作確認に加え、本番のKaggle実データで完走・実際に複数回submitし、
+  Private LB 0.79996（上記「最終結果」参照）まで確認済み。CVとPrivateの乖離は実測で
+  ±0.002程度に収まっており、`cv_scores.json` / `ensemble_report.json` のOOF AUCは
+  実際のLBと相関することを確認している。
 - **bureau_balance**は実データで2,700万行規模。48GBあれば一括で載るが、メモリ不足が出たら
   `feature_engineering.py` の該当集約を `chunksize` 読みに変更するのが先に手を付ける箇所。
+
+## セカンドパイプライン (hc_campaign) — 独立特徴量セットとのアンサンブル統合
+
+上記のメインパイプラインとは別に、独立した特徴量セット・モデル構成を持つ「セカンドパイプライン」
+（`hc_ensemble_optuna.py` + `_v2/_v3/_v4` + `hc_campaign.py`）を並行して構築し、
+最終的に**両パイプラインのOOF予測を混ぜる**ことで単独では届かなかったスコアを達成した。
+2つの独立した特徴量セットのOOFを混ぜること自体が強い多様性（アンサンブル効果）の源になる、
+という考え方（Kaggleの「チームマージ」に近い発想）。
+
+### 使い方
+
+```bash
+# 1. 特徴量構築（時間窓集約・KNN特徴・行レベル補助モデル・Null Importance選択、数時間）
+python3 hc_campaign.py features
+
+# 2. ハイパーパラメータ探索（Optuna、35%サンプル・3-fold・50試行）
+python3 hc_campaign.py tune
+
+# 3. モデル学習（lgb_gbdt_full/top600/nometa, lgb_dart/goss/rf, xgb, cat, mlp）
+python3 hc_campaign.py train all
+python3 hc_campaign.py train pseudo   # 最良モデルをベースに擬似ラベル
+
+# 4. メインパイプライン側のOOFを登録して多様性を追加
+python3 export_old_oof_for_registration.py
+python3 hc_campaign.py register old_lgb old_lgb_oof.csv old_lgb_pred.csv
+python3 hc_campaign.py register old_xgb old_xgb_oof.csv old_xgb_pred.csv
+python3 hc_campaign.py register old_cat old_cat_oof.csv old_cat_pred.csv
+
+# 5. アンサンブル（hillclimb + 2層stacking、良い方を自動選択）
+python3 hc_campaign.py ensemble my_tag
+
+# 状況確認（OOFストアの一覧・experiments.csvの履歴）
+python3 hc_campaign.py status
+```
+
+`hc_campaign.py train`は既存の`oof_store/{name}_oof.npy`があれば自動スキップするため、
+PCがクラッシュしても再実行するだけで途中から再開できる。
+
+### 最終追加施策（hc_v5 / hc_v6）
+
+CVが頭打ちになった段階で追加した最後の施策。
+
+```bash
+# 現申込の金利推定特徴を追加（previous_applicationでCNT_PAYMENT回帰モデル学習→適用）
+python3 hc_v5_final_push.py augment
+rm oof_store/lgb_gbdt_full_* oof_store/xgb_*
+python3 hc_campaign.py train lgb_gbdt_full
+python3 hc_campaign.py train xgb
+
+# POS_CASH行レベル特徴・KNNバリエーション（k=100/1000, 代替特徴空間k=500）
+python3 hc_v6_lastday.py posrow
+python3 hc_v6_lastday.py knnv
+
+# CatBoostネイティブカテゴリモデル（one-hotと異なる表現の多様性源）
+python3 hc_v6_lastday.py catnative
+
+# LightGBM 10-fold・低学習率(0.005)版
+python3 hc_v6_lastday.py f10
+
+# restackアンサンブル（OOFのrank + 強い生特徴量を混ぜたL2メタモデル）
+python3 hc_v5_final_push.py ensemble2
+```
+
+### 両パイプラインの整合性
+
+`StratifiedKFold(n_splits=5, shuffle=True, random_state=42)`をメイン・セカンド両方で
+統一しているため、OOFを`register`で相互に取り込んでもfold境界のズレによるリークが起きない。
+
+## 最終結果
+
+`experiments.csv`に記録した実際のKaggle提出結果（late submission）の推移:
+
+| 施策 | CV AUC | Public | Private |
+|---|---|---|---|
+| メインパイプライン単独（stacking_logit） | 0.79812 | — | — |
+| セカンドパイプライン単独（hillclimb） | 0.79942 | 0.79973 | 0.79634 |
+| 両パイプラインのOOFを統合（13モデルstack） | 0.80203 | 0.80065 | 0.79964 |
+| + NN/TabPFN系の多様性追加 | 0.80217 | — | — |
+| + Optunaチューニング + 全部入りstack | 0.80211 | 0.79989 | **0.79996** |
+
+Home Creditコンペは Public LB が Private LB より低く出る既知の傾向があり、CVとPrivateが
+ほぼ一致していることが「CVが信頼できている（過学習していない）」健全さのサイン。
+特徴量・バグ修正・デバッグの詳細な経緯は[`Home_Credit_取り組みまとめ.md`](./Home_Credit_取り組みまとめ.md)を参照。
 
 ## 参考にした解法・記事
 
