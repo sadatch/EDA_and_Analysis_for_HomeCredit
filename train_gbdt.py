@@ -24,7 +24,7 @@ from sklearn.model_selection import StratifiedKFold
 from sklearn.metrics import roc_auc_score
 
 import config
-from utils import timer, lgb_device_params, xgb_device_params
+from utils import timer, lgb_device_params, xgb_device_params, get_cv_splits
 
 warnings.filterwarnings("ignore")
 
@@ -146,16 +146,16 @@ def _lgb_train_one(params, X_trn, y_trn, X_val, y_val, cats):
 
 
 def _run_lightgbm_single(X, y, X_test, cats, params, seed):
-    folds = StratifiedKFold(n_splits=config.N_FOLDS, shuffle=True, random_state=seed)
+    splits = get_cv_splits(X, y, seed)
     oof = np.zeros(len(X))
     test = np.zeros(len(X_test))
     best_iters = []
     params = {**params, "random_state": seed, "seed": seed}
-    for fold_, (trn_idx, val_idx) in enumerate(folds.split(X, y)):
+    for fold_, (trn_idx, val_idx) in enumerate(splits):
         model = _lgb_train_one(params, X.iloc[trn_idx], y.iloc[trn_idx],
                                X.iloc[val_idx], y.iloc[val_idx], cats)
         oof[val_idx] = model.predict(X.iloc[val_idx], num_iteration=model.best_iteration)
-        test += model.predict(X_test, num_iteration=model.best_iteration) / folds.n_splits
+        test += model.predict(X_test, num_iteration=model.best_iteration) / len(splits)
         best_iters.append(model.best_iteration)
     return oof, test, best_iters
 
@@ -227,13 +227,13 @@ def _xgb_base_params():
 
 def _run_xgboost_single(X, y, X_test, params, seed):
     import xgboost as xgb
-    folds = StratifiedKFold(n_splits=config.N_FOLDS, shuffle=True, random_state=seed)
+    splits = get_cv_splits(X, y, seed)
     oof = np.zeros(len(X))
     test = np.zeros(len(X_test))
     best_iters = []
     params = {**params, "random_state": seed, "seed": seed}
     dtest = xgb.DMatrix(X_test, enable_categorical=True)
-    for fold_, (trn_idx, val_idx) in enumerate(folds.split(X, y)):
+    for fold_, (trn_idx, val_idx) in enumerate(splits):
         dtrain = xgb.DMatrix(X.iloc[trn_idx], label=y.iloc[trn_idx], enable_categorical=True)
         dvalid = xgb.DMatrix(X.iloc[val_idx], label=y.iloc[val_idx], enable_categorical=True)
         model = xgb.train(
@@ -243,7 +243,7 @@ def _run_xgboost_single(X, y, X_test, params, seed):
         )
         best = model.best_iteration + 1
         oof[val_idx] = model.predict(dvalid, iteration_range=(0, best))
-        test += model.predict(dtest, iteration_range=(0, best)) / folds.n_splits
+        test += model.predict(dtest, iteration_range=(0, best)) / len(splits)
         best_iters.append(best)
     return oof, test, best_iters
 

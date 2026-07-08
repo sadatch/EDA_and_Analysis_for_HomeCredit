@@ -27,7 +27,7 @@ from sklearn.metrics import roc_auc_score
 
 import config
 
-CANDIDATES = ["lgb", "xgb", "cat", "mlp", "lgbpl"]
+CANDIDATES = ["lgb", "xgb", "cat", "mlp", "tabm", "tabpfn", "lgbpl", "lgbdart", "gru"]
 
 
 def load_available_models():
@@ -91,7 +91,20 @@ def hill_climb(oof_matrix, y, max_steps=None):
     return weights, cur_auc
 
 
-# ---------- 3. stacking (2-level meta model) ----------
+# ---------- 3. rank-average blending (M5) ----------
+def rank_average_blend(oof_rank_matrix, test_rank_matrix, y):
+    """
+    等重み・順位平均ブレンド。weighted/hillclimbが「AUCを最大化する重み」を探すのに対し、
+    こちらは重み最適化を一切せず単純平均するため、少数モデル・小サンプルでの重み過学習に
+    強く、多様性の高いモデル集合ではシンプルに効くことが多い（1位解法discussion M5由来）。
+    """
+    oof_blend = oof_rank_matrix.mean(axis=1)
+    test_blend = test_rank_matrix.mean(axis=1)
+    auc = roc_auc_score(y, oof_blend)
+    return test_blend, auc
+
+
+# ---------- 4. stacking (2-level meta model) ----------
 def stacking(oof_matrix, test_matrix, y):
     folds = StratifiedKFold(n_splits=config.N_FOLDS, shuffle=True, random_state=config.SEED)
     meta_oof = np.zeros(len(y))
@@ -106,6 +119,50 @@ def stacking(oof_matrix, test_matrix, y):
         test_fold += lr.predict_proba(Ts)[:, 1] / folds.n_splits
     auc = roc_auc_score(y, meta_oof)
     return test_fold, auc
+
+
+# ---------- 5. stacking on logits (M4修理版) ----------
+def _logit(p, eps=1e-6):
+    p = np.clip(p, eps, 1 - eps)
+    return np.log(p / (1 - p))
+
+
+def stacking_logit(oof_matrix, test_matrix, y):
+    """
+    生確率ではなくlogit空間でメタLRを学習する（AmEx等の上位解法定石）。
+    確率の端(0/1付近)の情報が線形空間に引き延ばされるためLRとの相性が良く、
+    C=0.1の強めのL2でメタ過学習（前回stackingがweightedに大敗した原因の候補）を抑える。
+    """
+    Xl = _logit(oof_matrix)
+    Tl = _logit(test_matrix)
+    folds = StratifiedKFold(n_splits=config.N_FOLDS, shuffle=True, random_state=config.SEED)
+    meta_oof = np.zeros(len(y))
+    test_fold = np.zeros(test_matrix.shape[0])
+    scaler = StandardScaler()
+    Xs = scaler.fit_transform(Xl)
+    Ts = scaler.transform(Tl)
+    for trn, val in folds.split(Xs, y):
+        lr = LogisticRegression(max_iter=1000, C=0.1)
+        lr.fit(Xs[trn], y[trn])
+        meta_oof[val] = lr.predict_proba(Xs[val])[:, 1]
+        test_fold += lr.predict_proba(Ts)[:, 1] / folds.n_splits
+    auc = roc_auc_score(y, meta_oof)
+    return test_fold, auc
+
+
+# ---------- 6. top-k rank average ----------
+def topk_rank_average(oof_rank_matrix, test_rank_matrix, y, names, k=3):
+    """
+    単体OOF AUC上位k本だけの等重み順位平均。弱いメンバー（tabpfn等）を除外した
+    rankavgで、全員平均が弱メンバーに引きずられるケースの保険。
+    """
+    aucs = [roc_auc_score(y, oof_rank_matrix[:, i]) for i in range(oof_rank_matrix.shape[1])]
+    top_idx = np.argsort(aucs)[::-1][:min(k, len(aucs))]
+    oof_blend = oof_rank_matrix[:, top_idx].mean(axis=1)
+    test_blend = test_rank_matrix[:, top_idx].mean(axis=1)
+    auc = roc_auc_score(y, oof_blend)
+    used = [names[i] for i in top_idx]
+    return test_blend, auc, used
 
 
 def main():
@@ -151,12 +208,28 @@ def main():
         print(f"[hillclimb] OOF AUC={auc_h:.6f}  weights=" +
               ", ".join(f"{n}:{wi:.3f}" for n, wi in zip(names, w_h)))
 
-        # 3. stacking
+        # 3. rank-average blend (等重み、重み最適化なし)
+        test_r, auc_r = rank_average_blend(oof_rank, test_rank, y)
+        results["rankavg"] = auc_r
+        print(f"[rankavg  ] OOF AUC={auc_r:.6f}  (等重み順位平均, 重み最適化なし)")
+
+        # 4. stacking
         test_s, auc_s = stacking(oof_raw, test_raw, y)
         results["stacking"] = auc_s
         print(f"[stacking ] OOF AUC={auc_s:.6f}  (meta=LogisticRegression)")
 
-        method_tests = {"weighted": test_w, "hillclimb": test_h, "stacking": test_s}
+        # 5. stacking on logits (M4修理版: logit変換 + 強めのL2)
+        test_sl, auc_sl = stacking_logit(oof_raw, test_raw, y)
+        results["stacking_logit"] = auc_sl
+        print(f"[stack_lgt] OOF AUC={auc_sl:.6f}  (meta=LR on logits, C=0.1)")
+
+        # 6. 上位3本のみのrank平均（弱メンバー除外の保険）
+        test_t3, auc_t3, top3_used = topk_rank_average(oof_rank, test_rank, y, names, k=3)
+        results["top3rankavg"] = auc_t3
+        print(f"[top3rank ] OOF AUC={auc_t3:.6f}  (使用: {top3_used})")
+
+        method_tests = {"weighted": test_w, "hillclimb": test_h, "rankavg": test_r,
+                        "stacking": test_s, "stacking_logit": test_sl, "top3rankavg": test_t3}
         best_method = max(results, key=results.get)
         best_auc = results[best_method]
         final_test = method_tests[best_method]

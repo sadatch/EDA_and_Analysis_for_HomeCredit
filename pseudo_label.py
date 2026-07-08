@@ -23,7 +23,7 @@ from sklearn.model_selection import StratifiedKFold
 from sklearn.metrics import roc_auc_score
 
 import config
-from utils import timer
+from utils import timer, get_cv_splits
 from train_gbdt import load_features_with_dae, prepare_xy, _lgb_train_one, _lgb_base_params, _load_best_params
 
 warnings.filterwarnings("ignore")
@@ -84,15 +84,21 @@ def main():
     with timer("擬似ラベル付きLightGBM再学習 (seed平均)"):
         for s in seeds:
             p = {**params, "random_state": s, "seed": s}
-            folds = StratifiedKFold(n_splits=config.N_FOLDS, shuffle=True, random_state=s)
+            splits = get_cv_splits(X, y, s)
             oof = np.zeros(len(X))
             test = np.zeros(len(X_test))
-            for trn_idx, val_idx in folds.split(X, y):
+            for trn_idx, val_idx in splits:
                 X_trn = pd.concat([X.iloc[trn_idx], X_conf], axis=0)
+                # pd.concatはtrain/testでカテゴリ水準が異なるcategory列をobject(str)に劣化させ、
+                # LightGBMが "bad pandas dtypes" で落ちる（7/2・7/4のバッチで実際に発生）。
+                # concat後にcategoryへ再変換して両者の水準を統合する。
+                for c in cats:
+                    if c in X_trn.columns and not isinstance(X_trn[c].dtype, pd.CategoricalDtype):
+                        X_trn[c] = X_trn[c].astype("category")
                 y_trn = np.concatenate([y.iloc[trn_idx].values, pseudo_y])
                 model = _lgb_train_one(p, X_trn, y_trn, X.iloc[val_idx], y.iloc[val_idx].values, cats)
                 oof[val_idx] = model.predict(X.iloc[val_idx], num_iteration=model.best_iteration)
-                test += model.predict(X_test, num_iteration=model.best_iteration) / folds.n_splits
+                test += model.predict(X_test, num_iteration=model.best_iteration) / len(splits)
             oof_acc += oof / len(seeds)
             test_acc += test / len(seeds)
             print(f"  [LGBpl] seed={s}: OOF AUC={roc_auc_score(y, oof):.6f}")

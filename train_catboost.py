@@ -17,7 +17,7 @@ from sklearn.model_selection import StratifiedKFold
 from sklearn.metrics import roc_auc_score
 
 import config
-from utils import timer, cat_device_params
+from utils import timer, cat_device_params, get_cv_splits
 from train_gbdt import load_features_with_dae
 
 warnings.filterwarnings("ignore")
@@ -64,12 +64,12 @@ def _load_best_params():
 
 def _run_single(X, y, X_test, cats, params, seed):
     from catboost import CatBoostClassifier, Pool
-    folds = StratifiedKFold(n_splits=config.N_FOLDS, shuffle=True, random_state=seed)
+    splits = get_cv_splits(X, y, seed)
     oof = np.zeros(len(X))
     test = np.zeros(len(X_test))
     params = {**params, "random_seed": seed}
     test_pool = Pool(X_test, cat_features=cats)
-    for fold_, (trn_idx, val_idx) in enumerate(folds.split(X, y)):
+    for fold_, (trn_idx, val_idx) in enumerate(splits):
         trn_pool = Pool(X.iloc[trn_idx], y.iloc[trn_idx], cat_features=cats)
         val_pool = Pool(X.iloc[val_idx], y.iloc[val_idx], cat_features=cats)
         model = CatBoostClassifier(**params)
@@ -87,7 +87,7 @@ def _run_single(X, y, X_test, cats, params, seed):
             else:
                 raise
         oof[val_idx] = model.predict_proba(val_pool)[:, 1]
-        test += model.predict_proba(test_pool)[:, 1] / folds.n_splits
+        test += model.predict_proba(test_pool)[:, 1] / len(splits)
     return oof, test
 
 

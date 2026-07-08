@@ -109,9 +109,15 @@ CAT_TASK_TYPE = os.environ.get("HC_CAT_TASK", "GPU" if USE_GPU_GBDT else "CPU") 
 
 # ===== 特徴量エンジニアリングのトグル =====
 FE_USE_NEIGHBORS = _env_flag("HC_FE_NEIGHBORS", True)   # 1位の目玉: neighbors_target_mean
+FE_USE_NEIGHBORS_DIVERSITY = _env_flag("HC_FE_NEIGHBORS_DIV", True)  # P2: 複数解像度k(100/1000/2000)+別特徴空間+EXT差分
 FE_USE_TARGET_ENC = _env_flag("HC_FE_TARGET_ENC", True)  # CV安全なOOF target encoding
 FE_USE_DOMAIN = _env_flag("HC_FE_DOMAIN", True)          # 金融ドメイン特徴(DOM_*)
+FE_USE_TREND = _env_flag("HC_FE_TREND", True)            # 時系列傾き/WMA/申込ベロシティ/書類数/周期特徴/IsolationForest
+FE_USE_TOP_SOLUTION = _env_flag("HC_FE_TOP_SOLUTION", True)  # 1位解法discussion由来(年利率/EXT3除算/PREVスライス/INS細分化等)
+FE_USE_GAP = _env_flag("HC_FE_GAP", True)                # ギャップ特徴(GAP_*/COMBO_*/FREQ_*: 整合性/インターリーブ/存在フラグ/行動の質/カテゴリ組合せ)
+FE_USE_FINAL = _env_flag("HC_FE_FINAL", True)            # 最終バッチ特徴(FIN_*/GRP2_*: 定番比率/bureau後段比率/横断負担/上位交互作用/追加グループ相対)
 FE_SELECTION_APPLY = _env_flag("HC_APPLY_FS", False)     # feature_selection.jsonのdropを学習に反映するか
+ADV_FOLD_SPLIT = _env_flag("HC_ADV_FOLD", False)          # Adversarial Validationスコアで層化したCV fold（要: 事前にadversarial_validation.py実行）
 NEIGHBORS_K = _env_int("HC_NEIGHBORS_K", 100 if SMOKE else 500)
 # target encodingをかけるカテゴリ列（存在する列のみ使用）
 TARGET_ENC_COLS = [
@@ -123,7 +129,10 @@ TARGET_ENC_SMOOTHING = 20.0
 
 # ===== DAE設定 (ikiri_DS 2位解法を参考) =====
 # 元実装は隠れ層4096×3層。VRAM 8GBなら 1024〜2048 が安全。
-DAE_HIDDEN_DIM = _env_int("HC_DAE_HIDDEN", 256 if SMOKE else 1024)
+# 2026-07-05: 1024(→埋め込み3072次元)にした結果、GBDTへの入力特徴が倍増し
+# XGBoost(GPU)がVRAM超過で17時間ハングする事態が発生。256(→768次元、旧実績あり
+# gain share 27.4%)に戻し、GPU経路の速度を優先する方針に変更。
+DAE_HIDDEN_DIM = _env_int("HC_DAE_HIDDEN", 256)
 DAE_N_LAYERS = 3
 DAE_SWAP_RATE = _env_float("HC_DAE_SWAP_RATE", 0.15)
 DAE_EPOCHS = _env_int("HC_DAE_EPOCHS", 2 if SMOKE else 80)
@@ -156,8 +165,10 @@ MLP_EARLY_STOP_PATIENCE = 8
 PSEUDO_ENABLE = _env_flag("HC_PSEUDO", True)
 PSEUDO_ROUNDS = _env_int("HC_PSEUDO_ROUNDS", 1)
 # testの予測確率がこのしきい値より両極端な行だけをsoftラベルとして学習に追加
+# M6: 0.30は「やや自信がある」程度まで含んでしまい誤ラベル混入リスクが高いとの指摘（1位解法
+# discussion）。より確信度の高い行だけに絞るため0.75に引き上げ（必要ならHC_PSEUDO_HIGHで調整）。
 PSEUDO_LOW = _env_float("HC_PSEUDO_LOW", 0.02)
-PSEUDO_HIGH = _env_float("HC_PSEUDO_HIGH", 0.30)
+PSEUDO_HIGH = _env_float("HC_PSEUDO_HIGH", 0.75)
 
 # ===== 全データ再学習 (Grandmaster Playbook「7. extra training」) =====
 # CV後、best_iterationの平均で全データ(100%)再学習し、その予測をtest予測にブレンドする。
@@ -166,6 +177,17 @@ FULL_REFIT_WEIGHT = _env_float("HC_FULL_REFIT_WEIGHT", 0.5)  # final = (1-w)*cv_
 
 # ===== アンサンブル =====
 ENSEMBLE_HILLCLIMB_STEPS = _env_int("HC_HILLCLIMB_STEPS", 2000)
+
+# ===== GRU月次系列モデル (M3, スコープ縮小版: POS_CASH_balanceのみ) =====
+# 1位解法discussionが示唆する「月次系列を直接読むモデル」の第一歩。
+# bureau_balance/installments/credit_cardまで含めた完全版は別途拡張が必要（README参照）。
+GRU_ENABLE = _env_flag("HC_USE_GRU", True)
+GRU_MAX_LEN = _env_int("HC_GRU_MAX_LEN", 48)          # 直近48ヶ月分（それより古い月は切り捨て）
+GRU_HIDDEN = _env_int("HC_GRU_HIDDEN", 32 if SMOKE else 64)
+GRU_EPOCHS = _env_int("HC_GRU_EPOCHS", 2 if SMOKE else 20)
+GRU_BATCH_SIZE = _env_int("HC_GRU_BATCH", 512)
+GRU_LR = _env_float("HC_GRU_LR", 1e-3)
+GRU_EARLY_STOP_PATIENCE = _env_int("HC_GRU_PATIENCE", 4)
 
 
 def describe() -> str:

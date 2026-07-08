@@ -5,8 +5,13 @@ train/test を見分ける分類器（target = is_test）を作り、そのAUC�
 AUCが0.5付近ならtrain/testは同分布で安心。0.5から大きく外れる場合、
 重要度上位の列が「test特有の偏り」を持っているため、特徴から外すか扱いに注意する。
 
+trainの「testらしさ」スコアはOOFで算出し artifacts/adversarial_oof_score.npy に保存する。
+utils.get_cv_splits() がこれを読み、HC_ADV_FOLD=1のときCV foldをtest分布に近い形へ
+層化する（1位解法discussion: 「CVをtest分布に近づけるとLBとの相関が上がる」の指摘に対応）。
+
 出力:
   artifacts/adversarial_report.json   (AUC + 重要度上位の列)
+  artifacts/adversarial_oof_score.npy (trainの各行の「testらしさ」OOFスコア。fold層化用)
 """
 import json
 import warnings
@@ -41,13 +46,17 @@ def main():
     # OOF由来の特徴(target encoding / 近傍TARGET平均)は構造上train(OOF)とtest(full-fit)で
     # 分布が必ず少し異なるため、adversarialが常にそこを拾って本来の分布シフト診断を覆い隠す。
     # これらは除外して「生の特徴」での分布シフトを測る。
-    excluded = [c for c in X_tr.columns if c.startswith("TE_") or c.startswith("NEIGHBORS_TARGET_MEAN")]
+    excluded = [c for c in X_tr.columns if c.startswith("TE_") or c.startswith("NEIGHBORS_")]
     common = [c for c in X_tr.columns if c in X_te.columns and c not in excluded]
     if excluded:
         print(f"  adversarialから除外したOOF特徴: {len(excluded)}列")
     X = pd.concat([X_tr[common], X_te[common]], axis=0, ignore_index=True)
     y = np.concatenate([np.zeros(len(X_tr)), np.ones(len(X_te))])
     cats = [c for c in cats if c in common]
+    # train/testでカテゴリ集合が異なる列はconcatでobject(str)に化け、LightGBMが弾く。
+    # category型へ戻して回避する。
+    for c in cats:
+        X[c] = X[c].astype("category")
 
     folds = StratifiedKFold(n_splits=config.N_FOLDS, shuffle=True, random_state=config.SEED)
     oof = np.zeros(len(X))
@@ -70,6 +79,13 @@ def main():
     auc = roc_auc_score(y, oof)
     imp = pd.Series(importances, index=common).sort_values(ascending=False)
     top = imp.head(30)
+
+    # trainの各行の「testらしさ」OOFスコアを保存（utils.get_cv_splitsがfold層化に使う）
+    n_train = len(X_tr)
+    train_adv_oof = oof[:n_train]
+    np.save(config.ARTIFACT_DIR / "adversarial_oof_score.npy", train_adv_oof)
+    print(f"  trainの adversarial OOFスコアを保存: {config.ARTIFACT_DIR / 'adversarial_oof_score.npy'} "
+          f"({len(train_adv_oof)}行, HC_ADV_FOLD=1でtrain_gbdt.py等のfold層化に使われる)")
 
     print("=" * 60)
     print(f"Adversarial AUC = {auc:.4f}  (0.5付近=同分布で安心 / 高いほど分布シフト大)")

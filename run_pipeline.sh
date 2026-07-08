@@ -79,6 +79,17 @@ opt "[3] 特徴量選択 (null importance)" python3 feature_selection.py
 # ----- 3b. 特徴量重要度の分析（ドメイン特徴の効き目をカテゴリ別に確認） -----
 opt "[3b] 特徴量重要度の分析 (gain/グループ別ロールアップ)" python3 feature_importance.py
 
+# ----- 3c. 特徴量選択の高速A/B（軽量lgbでdrop適用の是非をデータで判定） -----
+# HC_AUTO_FS=1(デフォルト)なら、fs_ab.jsonの推奨に従い以降の学習にHC_APPLY_FSを自動設定。
+# 手動で固定したい場合は HC_AUTO_FS=0 HC_APPLY_FS=0/1 を指定。
+if [ "${HC_AUTO_FS:-1}" = "1" ] && [ -z "${HC_APPLY_FS:-}" ]; then
+    opt "[3c] 特徴量選択A/B (fs_quick_ab)" python3 fs_quick_ab.py
+    if [ -e "$ART_DIR/fs_ab.json" ]; then
+        export HC_APPLY_FS=$(python3 -c "import json;print(1 if json.load(open('$ART_DIR/fs_ab.json')).get('recommend_apply_fs') else 0)")
+        echo ">>> [3c] fs_ab.json の推奨により HC_APPLY_FS=$HC_APPLY_FS で以降を実行"
+    fi
+fi
+
 # ----- 4. DAE 学習 & 埋め込み抽出 -----
 if skip_if "$PROC_DIR/dae_train_embeddings.parquet"; then
     echo ">>> [4] DAE: キャッシュ済みスキップ"
@@ -99,8 +110,17 @@ must "[6] LightGBM + XGBoost 学習" python3 train_gbdt.py
 # ----- 7. CatBoost学習 -----
 opt "[7] CatBoost 学習" python3 train_catboost.py
 
-# ----- 8. MLP(DAE特徴)学習 -----
-opt "[8] MLP(DAE特徴) 学習" python3 train_nn.py
+# ----- 7b〜8d: デフォルト無効化（2026-07-02時点の実データ結果で判断） -----
+# artifacts/ensemble_report.json の実測: mlp=0.7659 / tabm=0.7735 / tabpfn=0.7642 は
+# lgb=0.7963 / xgb=0.7968 / cat=0.7917 に対し大幅に劣り、ブレンド後(weighted 0.79694)は
+# 単体最強xgb(0.79677)から+0.00017しか改善していない＝この3モデルの学習時間はほぼ無駄。
+# DART/GRUも同種の「効果未検証のモデル多様化」なので、まずは単体で軽く試してから
+# 効果が確認できた場合にのみ以下のコメントを外してフル実行に組み込むこと。
+# opt "[7b] LightGBM DART 学習" python3 train_lgb_dart.py
+# opt "[8] MLP(DAE特徴) 学習" python3 train_nn.py
+# opt "[8b] TabM (efficient MLP ensemble)" python3 train_tabm.py
+# opt "[8c] TabPFN/TabICL (foundation model)" python3 train_tabpfn.py
+# opt "[8d] GRU(POS_CASH月次系列)" python3 train_gru_seq.py
 
 # ----- 9. 擬似ラベル (LightGBM変種を追加) -----
 opt "[9] 擬似ラベル LightGBM" python3 pseudo_label.py

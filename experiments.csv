@@ -1,0 +1,4 @@
+date,tag,change,cv_auc,public_lb,private_lb,notes
+2026-07-08,hillclimb_cv0.79942,"old pipeline(768dim DAE) + hc_campaign hillclimb ensemble, late submission",0.79942,0.79973,0.79634,"列の順序を誤認していたため2026-07-08訂正: 左=Private/右=Public。CVとPrivateがほぼ一致(健全)、Publicが低いのはHome Creditの既知の乖離傾向"
+2026-07-08,day4_stack_cv0.80203,"old_lgb/old_xgb/old_cat registerして13モデルstack (LogReg+浅いLGBM on rank)",0.80203,0.80065,0.79964,"訂正: 左=Private/右=Public。CV-Private乖離-0.0024"
+2026-07-08,day6_tuned_cv0.80211,"old_mlp/tabm/tabpfn追加register + Optuna tuning後7モデル再学習 + 16モデルstack",0.80211,0.79989,0.79996,"訂正: 左=Private/右=Public。現時点の最良Private=0.79996、目標0.8まで残り0.00004"

@@ -15,6 +15,7 @@
   data/processed/feature_columns.json
 """
 import gc
+import os
 import json
 import re
 
@@ -26,6 +27,11 @@ import config
 from utils import timer, reduce_mem_usage, build_agg_rules, flatten_agg_columns, safe_merge
 import oof_features
 import domain_features
+import extra_features
+import trend_velocity_features as trend_feats
+import top_solution_features as top_feats
+import gap_features
+import final_features
 
 
 # =====================================================================
@@ -62,6 +68,19 @@ def get_aggregated_bureau() -> pd.DataFrame:
         ).reset_index()
         bb_agg = bb_agg.merge(bb_6m_agg, on="SK_ID_BUREAU", how="left")
 
+        if config.FE_USE_TREND:
+            # STATUS_NUMの線形回帰の傾き・加重平均（水準ではなく変化の速さ・方向を捉える）
+            bb_trend = trend_feats.bureau_balance_trend(bb)
+            if not bb_trend.empty:
+                bb_agg = bb_agg.merge(bb_trend, on="SK_ID_BUREAU", how="left")
+            del bb_trend
+            # P3: 最後の延滞から何ヶ月経過したか（recency）。6ヶ月窓の水準特徴と違い
+            # 「いつ悪化したか」を直接捉える正規化された指標。
+            bb_recency = trend_feats.bureau_balance_recency(bb)
+            if not bb_recency.empty:
+                bb_agg = bb_agg.merge(bb_recency, on="SK_ID_BUREAU", how="left")
+            del bb_recency
+
         bureau = bureau.merge(bb_agg, on="SK_ID_BUREAU", how="left")
         del bb, bb_agg, bb_6m, bb_6m_agg
         gc.collect()
@@ -92,6 +111,27 @@ def get_aggregated_bureau() -> pd.DataFrame:
         bureau_1yr_agg = flatten_agg_columns(bureau_1yr_agg, "BUREAU_1YR")
         bureau_agg = safe_merge(bureau_agg.reset_index(), bureau_1yr_agg.reset_index(), on="SK_ID_CURR").set_index("SK_ID_CURR")
         del bureau_1yr_agg
+
+    if config.FE_USE_TREND:
+        # 信用の種類の多様性（OHE+sum/meanでは失われるdistinct数。クレジットハンガーの別シグナル）
+        diversity = trend_feats.bureau_credit_type_diversity(bureau)
+        if not diversity.empty:
+            bureau_agg = safe_merge(bureau_agg.reset_index(), diversity, on="SK_ID_CURR").set_index("SK_ID_CURR")
+        del diversity
+
+    if config.FE_USE_TOP_SOLUTION:
+        # アクティブローンに絞った直近性・残債合計（1位解法discussion由来）
+        last_active = top_feats.bureau_last_active_snapshot(bureau)
+        if not last_active.empty:
+            bureau_agg = safe_merge(bureau_agg.reset_index(), last_active, on="SK_ID_CURR").set_index("SK_ID_CURR")
+        del last_active
+
+    if config.FE_USE_GAP:
+        # 同時進行ローン数・完済recency・借入空白期間・アクティブ残存月数（チャット提案分）
+        timeline = gap_features.bureau_timeline_features(bureau)
+        if not timeline.empty:
+            bureau_agg = safe_merge(bureau_agg.reset_index(), timeline, on="SK_ID_CURR").set_index("SK_ID_CURR")
+        del timeline
 
     del bureau, bureau_ohe, bureau_6m, bureau_1yr
     gc.collect()
@@ -131,6 +171,27 @@ def get_aggregated_previous() -> pd.DataFrame:
     prev_agg = flatten_agg_columns(prev_agg, "PREV").reset_index()
     prev_agg = safe_merge(prev_agg, last_app_feats, on="SK_ID_CURR")
 
+    if config.FE_USE_TREND:
+        # 自社への申込間隔（ベロシティ）＋直近3件の謝絶率（bureauの他社照会件数とは別軸）
+        velocity = trend_feats.previous_application_velocity(prev)
+        if not velocity.empty:
+            prev_agg = safe_merge(prev_agg, velocity, on="SK_ID_CURR")
+        del velocity
+
+    if config.FE_USE_TOP_SOLUTION:
+        # 直近3/5件・最初2/4件のスライス集約 + 最新PRODUCT_COMBINATION（1位解法discussion由来）
+        slices = top_feats.previous_application_slices(prev)
+        if not slices.empty:
+            prev_agg = safe_merge(prev_agg, slices, on="SK_ID_CURR")
+        del slices
+
+    if config.FE_USE_GAP:
+        # 直近の謝絶/承認からの経過日数・最新決定が謝絶かフラグ（チャット提案分）
+        recency = gap_features.previous_recency_features(prev)
+        if not recency.empty:
+            prev_agg = safe_merge(prev_agg, recency, on="SK_ID_CURR")
+        del recency
+
     del prev, prev_ohe, last_app_feats
     gc.collect()
     return reduce_mem_usage(prev_agg)
@@ -158,6 +219,20 @@ def get_aggregated_pos_cash() -> pd.DataFrame:
         pos_agg = safe_merge(pos_agg.reset_index(), pos_3m_agg.reset_index(), on="SK_ID_CURR").set_index("SK_ID_CURR")
         del pos_3m_agg
 
+    if config.FE_USE_TREND:
+        # SK_DPDの線形回帰の傾き（ローン単位で悪化速度を捉えてから顧客単位に集約）
+        pos_trend = trend_feats.pos_cash_trend_features(pos)
+        if not pos_trend.empty:
+            pos_agg = safe_merge(pos_agg.reset_index(), pos_trend, on="SK_ID_CURR").set_index("SK_ID_CURR")
+        del pos_trend
+
+    if config.FE_USE_GAP:
+        # 予定より早く完済した契約数・比率（優良客シグナル、チャット提案分）
+        pos_beh = gap_features.pos_behavior_features(pos)
+        if not pos_beh.empty:
+            pos_agg = safe_merge(pos_agg.reset_index(), pos_beh, on="SK_ID_CURR").set_index("SK_ID_CURR")
+        del pos_beh
+
     del pos, pos_ohe, pos_3m
     gc.collect()
     return reduce_mem_usage(pos_agg.reset_index())
@@ -171,12 +246,14 @@ def get_aggregated_installments() -> pd.DataFrame:
     ins = pd.read_csv(config.RAW_DIR / config.RAW_FILES["installments"])
 
     ins["PAYMENT_DEFICIT"] = ins["AMT_INSTALMENT"] - ins["AMT_PAYMENT"]
+    ins["PAYMENT_RATIO"] = ins["AMT_PAYMENT"] / (ins["AMT_INSTALMENT"] + 1e-5)
     ins["PAYMENT_DELAY"] = ins["DAYS_ENTRY_PAYMENT"] - ins["DAYS_INSTALMENT"]
     ins["IS_LATE"] = (ins["PAYMENT_DELAY"] > 0).astype(np.int8)
     ins["IS_UNDERPAID"] = (ins["PAYMENT_DEFICIT"] > 0).astype(np.int8)
 
     base_rules = {
         "PAYMENT_DEFICIT": ["max", "mean", "sum", "std"],
+        "PAYMENT_RATIO": ["min", "mean", "std"],
         "PAYMENT_DELAY": ["max", "min", "mean", "std"],
         "AMT_INSTALMENT": ["max", "min", "mean", "sum"],
         "AMT_PAYMENT": ["max", "min", "mean", "sum"],
@@ -195,7 +272,52 @@ def get_aggregated_installments() -> pd.DataFrame:
     ins_1yr_agg = flatten_agg_columns(ins_1yr_agg, "INS_1YR").reset_index()
 
     ins_agg = safe_merge(ins_agg_all, ins_1yr_agg, on="SK_ID_CURR")
-    del ins, ins_1yr, ins_agg_all, ins_1yr_agg
+
+    # ③ 直近3回の支払行動スナップショット（最新の挙動を直接特徴化）
+    ins_sorted = ins.sort_values(["SK_ID_CURR", "DAYS_INSTALMENT"], ascending=[True, False])
+    last3 = ins_sorted.groupby("SK_ID_CURR").head(3)
+    last3_agg = last3.groupby("SK_ID_CURR").agg(
+        INS_LAST3_LATE_MEAN=("IS_LATE", "mean"),
+        INS_LAST3_DEFICIT_MEAN=("PAYMENT_DEFICIT", "mean"),
+        INS_LAST3_PAYRATIO_MEAN=("PAYMENT_RATIO", "mean"),
+        INS_LAST3_DELAY_MAX=("PAYMENT_DELAY", "max"),
+    ).reset_index()
+    ins_agg = safe_merge(ins_agg, last3_agg, on="SK_ID_CURR")
+
+    if config.FE_USE_TREND:
+        # PAYMENT_RATIOの線形回帰の傾き（ローン単位で悪化速度を捉えてから顧客単位に集約）
+        ins_trend = trend_feats.installments_trend_features(ins)
+        if not ins_trend.empty:
+            ins_agg = safe_merge(ins_agg, ins_trend, on="SK_ID_CURR")
+        del ins_trend
+
+    if config.FE_USE_TOP_SOLUTION:
+        # 期間別集約の細分化（60/90/180/1000日）+ 回次別集約（初回〜4回目）（1位解法discussion由来）
+        ins_periods = top_feats.installments_period_slices(ins)
+        if not ins_periods.empty:
+            ins_agg = safe_merge(ins_agg, ins_periods, on="SK_ID_CURR")
+        del ins_periods
+        ins_by_num = top_feats.installments_by_number(ins)
+        if not ins_by_num.empty:
+            ins_agg = safe_merge(ins_agg, ins_by_num, on="SK_ID_CURR")
+        del ins_by_num
+        # P4: 指数減衰加重DPD合計 / 早期完済比率・日数（installments深掘り特徴）
+        ins_adv = top_feats.installments_advanced_features(ins)
+        if not ins_adv.empty:
+            ins_agg = safe_merge(ins_agg, ins_adv, on="SK_ID_CURR")
+        del ins_adv
+
+    # ④ 悪化トレンド（直近1年 vs 全期間のデルタ。プラスなら直近で悪化）
+    if "INS_1YR_IS_LATE_mean" in ins_agg and "INS_ALL_IS_LATE_mean" in ins_agg:
+        ins_agg["INS_TREND_LATE"] = ins_agg["INS_1YR_IS_LATE_mean"] - ins_agg["INS_ALL_IS_LATE_mean"]
+        # P4: 差分だけでなく比率でも捉える（悪化率の非線形な強調, 分母0近傍はEPSでガード）
+        ins_agg["INS_TREND_LATE_RATIO"] = (
+            ins_agg["INS_1YR_IS_LATE_mean"] / (ins_agg["INS_ALL_IS_LATE_mean"] + 1e-5)
+        )
+    if "INS_1YR_PAYMENT_DEFICIT_mean" in ins_agg and "INS_ALL_PAYMENT_DEFICIT_mean" in ins_agg:
+        ins_agg["INS_TREND_DEFICIT"] = ins_agg["INS_1YR_PAYMENT_DEFICIT_mean"] - ins_agg["INS_ALL_PAYMENT_DEFICIT_mean"]
+
+    del ins, ins_1yr, ins_agg_all, ins_1yr_agg, ins_sorted, last3, last3_agg
     gc.collect()
     return reduce_mem_usage(ins_agg)
 
@@ -227,6 +349,20 @@ def get_aggregated_credit_card() -> pd.DataFrame:
         cc_6m_agg = flatten_agg_columns(cc_6m_agg, "CC_6M").reset_index()
         cc_agg = safe_merge(cc_agg, cc_6m_agg, on="SK_ID_CURR")
         del cc_6m_agg
+
+    if config.FE_USE_TREND:
+        # 利用率(UTILIZATION)の線形回帰の傾き（ローン単位で悪化速度を捉えてから顧客単位に集約）
+        cc_trend = trend_feats.credit_card_trend_features(cc)
+        if not cc_trend.empty:
+            cc_agg = safe_merge(cc_agg, cc_trend, on="SK_ID_CURR")
+        del cc_trend
+
+    if config.FE_USE_GAP:
+        # 支払いが最低額に張り付いている月の比率（リボ苦境シグナル、チャット提案分）
+        cc_beh = gap_features.credit_card_behavior_features(cc)
+        if not cc_beh.empty:
+            cc_agg = safe_merge(cc_agg, cc_beh, on="SK_ID_CURR")
+        del cc_beh
 
     # --- streak特徴（既存notebook由来：残高が連続して増え続けた最大月数） ---
     cc_sorted = cc.sort_values(["SK_ID_CURR", "MONTHS_BALANCE"], ascending=[True, True])
@@ -272,9 +408,15 @@ def main():
         df["EXT_SOURCE_MIN"] = df[["EXT_SOURCE_1", "EXT_SOURCE_2", "EXT_SOURCE_3"]].min(axis=1)
         df["EXT_SOURCE_PROD"] = df["EXT_SOURCE_1"] * df["EXT_SOURCE_2"] * df["EXT_SOURCE_3"]
         df["EXT_SOURCE_STD"] = df[["EXT_SOURCE_1", "EXT_SOURCE_2", "EXT_SOURCE_3"]].std(axis=1)
+        # 補完前の欠損数（生の欠損パターンは情報）
+        df["EXT_SOURCE_NAN_COUNT"] = df[["EXT_SOURCE_1", "EXT_SOURCE_2", "EXT_SOURCE_3"]].isnull().sum(axis=1).astype(np.int8)
 
     print("算術交互作用特徴を追加 (1位チーム手法)...")
     app_train, app_test = oof_features.add_arithmetic_interactions(app_train, app_test)
+
+    if config.FE_USE_TOP_SOLUTION:
+        with timer("EXT_SOURCE_3除算特徴 / AGE_INT (1位解法discussion由来)"):
+            app_train, app_test = top_feats.add_application_level_priority_features(app_train, app_test)
 
     table_builders = [
         ("bureau", get_aggregated_bureau),
@@ -291,10 +433,23 @@ def main():
             del agg_df
             gc.collect()
 
+    if config.FE_USE_TOP_SOLUTION:
+        with timer("年利率(Newton法IRR近似) / 追加比率特徴 (1位解法discussion由来)"):
+            app_train, app_test = top_feats.add_post_merge_priority_features(app_train, app_test)
+
     with timer("カラム名クリーニング"):
         # LightGBM/XGBoostが嫌う特殊文字を一括除去
         app_train = app_train.rename(columns=lambda x: re.sub(r"[^A-Za-z0-9_]+", "", x))
         app_test = app_test.rename(columns=lambda x: re.sub(r"[^A-Za-z0-9_]+", "", x))
+
+    if config.FE_USE_GAP:
+        with timer("ギャップ特徴 (存在フラグ/NaNパターン/キリ番/整合性/カテゴリ組合せ)"):
+            # 注意: EXT_SOURCE補完・OOF特徴付与の前に呼ぶこと（生の欠損パターンを特徴化するため）
+            app_train, app_test = gap_features.add_post_merge_gap_features(app_train, app_test)
+
+    if config.FE_USE_FINAL:
+        with timer("最終バッチ特徴 (定番比率/bureau後段/横断負担/交互作用/GRP2)"):
+            app_train, app_test = final_features.add_final_features(app_train, app_test)
 
     with timer("EXT_SOURCE_1 欠損値のLightGBM予測補完"):
         features_for_imputation = [
@@ -322,13 +477,31 @@ def main():
         with timer("金融ドメイン特徴 (DTI/延滞/ベロシティ/利用率 等)"):
             app_train, app_test = domain_features.add_domain_features(app_train, app_test)
 
+    if config.FE_USE_TREND:
+        with timer("書類提出数/周期エンコーディング/IsolationForest異常度"):
+            app_train, app_test = trend_feats.add_application_level_all(app_train, app_test)
+
     if config.FE_USE_NEIGHBORS:
         with timer("近傍TARGET平均 (1位の目玉特徴, OOFリーク制御)"):
             app_train, app_test = oof_features.add_neighbor_target_features(app_train, app_test)
+        if config.FE_USE_NEIGHBORS_DIVERSITY:
+            with timer("近傍特徴の多様化 (P2: 複数解像度k/別特徴空間/EXT_SOURCE差分)"):
+                app_train, app_test = oof_features.add_neighbor_diversity_features(app_train, app_test)
+        if config.FE_USE_FINAL:
+            app_train, app_test = final_features.add_post_neighbor_interactions(app_train, app_test)
 
     if config.FE_USE_TARGET_ENC:
         with timer("OOF target encoding"):
             app_train, app_test = oof_features.add_target_encoding(app_train, app_test)
+            if config.FE_USE_GAP:
+                combo_cols = gap_features.get_combo_columns(app_train)
+                if combo_cols:
+                    app_train, app_test = oof_features.add_target_encoding(app_train, app_test, cols=combo_cols)
+
+    # 追加特徴（EXT高次/相互作用・グループ相対z-score・k-meansクラスタ距離。target非依存）
+    if os.environ.get("HC_FE_EXTRA", "1") == "1":
+        with timer("追加特徴 (EXT poly / group相対 / k-means)"):
+            app_train, app_test = extra_features.add_all(app_train, app_test)
 
     with timer("メモリ最適化 & 保存"):
         app_train = reduce_mem_usage(app_train)

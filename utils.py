@@ -60,7 +60,11 @@ def fast_auc(y_true: np.ndarray, y_score: np.ndarray) -> float:
 def lgb_device_params() -> dict:
     """LightGBMのデバイス/並列パラメータ。GPU指定でも失敗時はtrainer側でCPUへ落とす想定。"""
     p = {"num_threads": config.N_THREADS}
-    if config.LGB_DEVICE == "gpu":
+    if config.LGB_DEVICE == "cuda":
+        # CUDAビルド済みのLightGBMが必要(USE_CUDA=ON)。WSL2+CUDAではこちらが確実。
+        # max_bin<=255必須。未対応ならtrainerがCPUへフォールバック。
+        p.update({"device_type": "cuda", "gpu_device_id": 0, "max_bin": 255})
+    elif config.LGB_DEVICE == "gpu":
         # OpenCLビルド済みのLightGBMが必要。未対応ならtrainerがCPUへフォールバック。
         p.update({"device_type": "gpu", "gpu_platform_id": 0, "gpu_device_id": 0,
                   "max_bin": 255})
@@ -127,6 +131,44 @@ def reduce_mem_usage(df: pd.DataFrame, verbose: bool = True) -> pd.DataFrame:
         print(f"  メモリ使用量: {start_mem:.1f}MB -> {end_mem:.1f}MB "
               f"({100 * (start_mem - end_mem) / max(start_mem, 1e-9):.1f}% 削減)")
     return df
+
+
+def get_cv_splits(X: pd.DataFrame, y, seed: int):
+    """
+    CV分割（list of (train_idx, val_idx)）を返す共通ヘルパ。
+    train_gbdt.py / train_catboost.py / pseudo_label.py 等、全trainerがここを通す。
+
+    config.ADV_FOLD_SPLIT=True かつ artifacts/adversarial_oof_score.npy があれば、
+    Adversarial Validationの「testらしさ」スコア（adversarial_validation.py が
+    OOFで算出）で層化したfold分割を使う。1位解法discussionの指摘（train/testの分布差が
+    大きい場合、CVをtest分布に近づけるとLBとの相関が上がる）に基づく。
+    TARGETによる層化はそのまま維持しつつ（TARGET, testらしさ分位）の複合ラベルで
+    StratifiedKFoldするため、doc記載の「上位20%を常にvalidation」方式と違い、
+    全foldが均等にOOFカバレッジを持つ（＝testに近い行だけが検証から漏れることがない）。
+
+    スコアファイルが無い/行数不一致の場合は通常のTARGET層化StratifiedKFoldにフォールバックする。
+    """
+    from sklearn.model_selection import StratifiedKFold
+    n_splits = config.N_FOLDS
+
+    if config.ADV_FOLD_SPLIT:
+        score_path = config.ARTIFACT_DIR / "adversarial_oof_score.npy"
+        if score_path.exists():
+            adv_score = np.load(score_path)
+            if len(adv_score) == len(X):
+                score_bin = pd.qcut(pd.Series(adv_score).reset_index(drop=True),
+                                     q=min(10, n_splits * 2), labels=False, duplicates="drop")
+                y_series = pd.Series(np.asarray(y)).reset_index(drop=True).astype(int).astype(str)
+                combo = y_series + "_" + score_bin.astype(str)
+                skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=seed)
+                return list(skf.split(X, combo))
+            print("  [cv] adversarial_oof_score.npyの行数がXと不一致のため通常のKFoldにフォールバック")
+        else:
+            print("  [cv] HC_ADV_FOLD=1だが adversarial_oof_score.npy が無いため通常のKFoldにフォールバック"
+                  "（先に `python3 adversarial_validation.py` を実行してください）")
+
+    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=seed)
+    return list(skf.split(X, y))
 
 
 def build_agg_rules(df: pd.DataFrame, id_cols, bool_aggs=("mean", "sum"),

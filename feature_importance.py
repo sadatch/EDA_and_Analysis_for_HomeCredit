@@ -43,14 +43,21 @@ def group_of(name: str) -> str:
         return "DAE(2位)"
     if name.startswith("TE_"):
         return "TargetEnc"
-    if name.startswith("NEIGHBORS_TARGET_MEAN"):
-        return "Neighbors(1位)"
+    if name.startswith("NEIGHBORS_"):
+        return "Neighbors(1位+P2多様化)"
     for pref, g in [("BUREAU", "BUREAU"), ("PREV", "PREV"), ("POS", "POS"),
                     ("INS", "INSTALLMENTS"), ("CC", "CREDIT_CARD")]:
         if name.startswith(pref):
             return g
     if name.startswith("EXT_SOURCE"):
         return "EXT_SOURCE"
+    if (name.startswith("DOC_") or name.startswith("HOUR_") or name.startswith("WEEKDAY_")
+            or name.startswith("IS_WEEKEND_APPR") or name.startswith("ISO_ANOMALY")):
+        return "TREND_VEL(新規)"  # trend_velocity_features.py: 書類数/周期特徴/IsolationForest
+    if (name.startswith("EXT3_DIV_") or name in ("AGE_INT", "YEARLY_INTEREST_RATE",
+            "MONTHLY_INTEREST_RATE", "INCOME_ANNUITY_RATIO", "ANNUITY_TO_MAX_INSTALLMENT_RATIO",
+            "PRED_CNT_PAYMENT", "CREDIT_x_YEARLY_RATE", "RATE_VS_PREV_MEAN_RATIO")):
+        return "TOP_SOLUTION(新規)"  # top_solution_features.py: 1位解法discussion由来
     return "APPLICATION(他)"
 
 
